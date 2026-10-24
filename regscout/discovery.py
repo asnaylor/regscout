@@ -36,6 +36,21 @@ SUPPORTED_LOCKFILES = (
     "Cargo.lock",
 )
 
+TRIVY_EXTRA_LOCKFILES = (
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "gemfile.lock",
+    "composer.lock",
+    "pom.xml",
+    "build.gradle.lockfile",
+    "podfile.lock",
+    "packages.lock.json",
+    "mix.lock",
+    "pubspec.lock",
+    "pipfile.lock",
+    "conan.lock",
+)
+
 
 @dataclass
 class DiscoveredImage:
@@ -576,6 +591,15 @@ def _parse_cargo_lock(path: str, display_path: str) -> List[DiscoveredPackage]:
                 )
             )
     return packages
+
+
+def is_trivy_fs_target(path: str) -> bool:
+    """Return True if `path` is a directory or a third-party lockfile supported via `trivy fs`."""
+    if os.path.isdir(path):
+        return True
+    if os.path.isfile(path) and os.path.basename(path).lower() in TRIVY_EXTRA_LOCKFILES:
+        return True
+    return False
 
 
 def parse_lockfile(

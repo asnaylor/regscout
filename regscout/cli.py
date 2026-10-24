@@ -6,23 +6,24 @@ import argparse
 import dataclasses
 import json
 import os
+import shutil
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from regscout import __version__
-from regscout.discovery import resolve_explicit_targets
+from regscout.discovery import is_trivy_fs_target, resolve_explicit_targets
 from regscout.scanners import (
     ImageScanResult,
     PackageScanResult,
     SEVERITY_ORDER,
     VulnerabilityFinding,
     clean_description,
-    merge_findings,
     pick_highest_fix_version,
     query_packages_multi_source,
     scan_docker_scout_image,
-    scan_github_advisories_and_cvenow_candidates,
     scan_harbor_image,
+    scan_local_trivy_fs,
+    scan_local_trivy_image,
     scan_oci_sbom_attestation,
     scan_quay_image,
 )
@@ -210,11 +211,22 @@ def run_scan(
     platform: str = "linux/amd64",
     quiet: bool = False,
     warnings_out: Optional[List[str]] = None,
+    allow_local_trivy: bool = True,
 ) -> Tuple[List[ImageScanResult], List[PackageScanResult]]:
     parse_warnings: List[str] = []
+    builtin_lockfiles: List[str] = []
+    trivy_fs_targets: List[str] = []
+    has_local_trivy = allow_local_trivy and bool(shutil.which("trivy"))
+
+    for lf in lockfile_paths:
+        if has_local_trivy and is_trivy_fs_target(lf):
+            trivy_fs_targets.append(lf)
+        else:
+            builtin_lockfiles.append(lf)
+
     images, packages = resolve_explicit_targets(
         image_refs,
-        lockfile_paths,
+        builtin_lockfiles,
         pkg_specs,
         warnings=parse_warnings,
     )
@@ -230,9 +242,8 @@ def run_scan(
         packages = [p for p in packages if p.direct]
 
     image_results: List[ImageScanResult] = []
-    image_cvenow_specs: List[Tuple[int, Tuple[str, str, str]]] = []
 
-    for idx, img in enumerate(images):
+    for img in images:
         res = ImageScanResult(
             image=img.raw,
             registry=img.registry,
@@ -262,45 +273,32 @@ def run_scan(
         if not registry_scanned and res.status not in ("auth_required", "not_found"):
             registry_scanned = scan_oci_sbom_attestation(img, res, platform=platform)
 
-        # Step 3: Verified OCI Source Label -> GitHub Security Advisories (fallback only)
+        # Step 3: Local Trivy CLI Fallback (`trivy image`) when no registry scan or OCI SBOM exists
         if not registry_scanned and res.status not in ("auth_required", "not_found"):
-            candidate_specs = scan_github_advisories_and_cvenow_candidates(
-                img, res, platform=platform
+            registry_scanned = scan_local_trivy_image(
+                img,
+                res,
+                platform=platform,
+                scan_timeout=max(scan_timeout, 300),
+                quiet=quiet,
+                allow_local_trivy=allow_local_trivy,
             )
-            for spec in candidate_specs:
-                image_cvenow_specs.append((idx, spec))
 
         if not res.scanners_used and res.status == "ok":
             res.status = "unscanned"
             if not res.notes:
                 res.notes.append(
-                    "No native registry scan, OCI SBOM attestation, or upstream GitHub advisory source found"
+                    "No native registry scan or OCI SBOM attestation found (install `trivy` via `brew install trivy` to scan unindexed images)"
                 )
 
+        res.findings = _filter_findings(res.findings, min_sev_rank, fixable_only)
         image_results.append(res)
 
     all_specs: List[Tuple[str, str, str]] = [
         (p.ecosystem, p.name, p.version) for p in packages
-    ] + [spec for _idx, spec in image_cvenow_specs]
+    ]
 
     pkg_map_results, batch_errors = query_packages_multi_source(all_specs)
-
-    for img_idx, spec in image_cvenow_specs:
-        res = image_results[img_idx]
-        if batch_errors and not res.scanners_used:
-            res.status = "error"
-            res.notes.extend(batch_errors)
-            continue
-        for src_label in ("osv.dev", "cve.now"):
-            if src_label not in res.scanners_used:
-                res.scanners_used.append(src_label)
-        spec_findings = pkg_map_results.get(spec, [])
-        if res.status == "unscanned" and not batch_errors:
-            res.status = "ok"
-        res.findings = merge_findings(res.findings, spec_findings)
-
-    for res in image_results:
-        res.findings = _filter_findings(res.findings, min_sev_rank, fixable_only)
 
     pkg_results: List[PackageScanResult] = []
     for p in packages:
@@ -321,6 +319,23 @@ def run_scan(
                 findings=filtered,
             )
         )
+
+    for target_path in trivy_fs_targets:
+        fs_pkgs, fs_warnings = scan_local_trivy_fs(
+            target_path,
+            scan_timeout=max(scan_timeout, 180),
+            quiet=quiet,
+        )
+        if warnings_out is not None:
+            warnings_out.extend(fs_warnings)
+        if not quiet:
+            for w in fs_warnings:
+                print(f"[regscout] warning: {w}", file=sys.stderr)
+        for pr in fs_pkgs:
+            if direct_only and not pr.direct:
+                continue
+            pr.findings = _filter_findings(pr.findings, min_sev_rank, fixable_only)
+            pkg_results.append(pr)
 
     return image_results, pkg_results
 
@@ -640,7 +655,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--lockfile",
         action="append",
         default=[],
-        help="Path to a dependency lockfile to scan (go.mod, requirements.txt, uv.lock, poetry.lock, package-lock.json, Cargo.lock).",
+        help=(
+            "Path to a dependency lockfile or directory to scan "
+            "(go.mod, requirements.txt, uv.lock, poetry.lock, package-lock.json, Cargo.lock; "
+            "or directory / third-party lockfile via local Trivy if installed)."
+        ),
     )
     parser.add_argument(
         "-p",
@@ -694,6 +713,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Do not trigger a new server-side Trivy scan on Harbor if an artifact is unscanned.",
     )
     parser.add_argument(
+        "--no-local-trivy",
+        action="store_true",
+        help="Do not fall back to local 'trivy' CLI when an image lacks a registry scan and OCI SBOM.",
+    )
+    parser.add_argument(
         "--scan-timeout",
         type=int,
         default=60,
@@ -742,6 +766,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             platform=args.platform,
             quiet=args.quiet or (args.format == "json"),
             warnings_out=scan_warnings,
+            allow_local_trivy=not args.no_local_trivy,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

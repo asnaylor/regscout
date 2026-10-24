@@ -34,12 +34,12 @@ It does **not** crawl directories automatically—pass the exact images, lockfil
 
 ---
 
-## 2. How `regscout` Scans Without Pulling
+## 2. How `regscout` Scans
 
-1. **Native Registry Scanners**:
+1. **Native Registry Scanners (Zero-Pull)**:
    - **Harbor v2 (`registry.nersc.gov`, etc.)**: Verifies Harbor v2 via `/api/v2.0/systeminfo`, queries Trivy `scan_overview` via Harbor REST API v2 using local Podman/Docker credentials (`~/.config/containers/auth.json` or `~/.docker/config.json`), and **auto-triggers a scan (`POST .../scan`) if unscanned**.
    - **Red Hat Quay (`quay.io`)**: Resolves multi-arch manifest lists to `--platform` (default `linux/amd64`) and queries Quay's Clair v4 `/security?vulnerabilities=true` endpoint.
    - **Docker Hub (`docker.io`)**: Resolves the `--platform` digest and queries Docker Scout GraphQL (`https://api.dso.docker.com/v1/graphql`).
 2. **Zero-Pull OCI SBOM Attestation (`oci-sbom-osv`)**: For registries without native scan APIs (like `ghcr.io`, `gcr.io`, `registry.k8s.io`), inspects the OCI Image Index for BuildKit/in-toto SPDX or CycloneDX SBOM attestations, extracts all OS and language PURLs, and batch-queries **[OSV.dev](https://osv.dev)**.
-3. **Verified OCI Source Labels -> GitHub Advisories (`github-advisories`)**: Inspects OCI config/manifest annotations (`org.opencontainers.image.source`) to resolve the upstream GitHub `owner/repo`, queries GitHub Security Advisories, and cross-checks verified package specs on `OSV.dev` and `cve.now`.
-4. **Lockfiles & `--pkg` via `OSV.dev` + `cve.now`**: Queries both `https://api.osv.dev/v1/querybatch` and `https://cve.now/stack` and merges/deduplicates findings by CVE/GHSA alias.
+3. **Local Trivy Fallback (`trivy-local` + `osv.dev`)**: If an image has neither a native registry scanner nor an attached OCI SBOM attestation, `regscout` never guesses based on GitHub repository names. If `trivy` is installed locally (`shutil.which("trivy")`), `regscout` runs `trivy image --scanners vuln --list-all-pkgs --format json --quiet` and cross-checks extracted OS/language PURLs (including source package PURLs) against live `OSV.dev`. If `trivy` is not installed (or `--no-local-trivy` is set), `regscout` marks the image `status = "unscanned"` and recommends installing `trivy` (`brew install trivy`).
+4. **Lockfiles & `--pkg` via `OSV.dev` + `cve.now` (with `trivy fs` fallback)**: Queries both `https://api.osv.dev/v1/querybatch` and `https://cve.now/stack` and merges/deduplicates findings by CVE/GHSA/upstream alias. Falls back to `trivy fs --scanners vuln` when `--lockfile` is passed a directory or third-party lockfile (`yarn.lock`, `pnpm-lock.yaml`, `Gemfile.lock`, `composer.lock`, `pom.xml`, etc.).

@@ -25,13 +25,15 @@ from regscout.scanners import (
     PackageScanResult,
     VulnerabilityFinding,
     _cmp_semver,
+    _parse_osv_vuln_detail,
     _version_matches_cvenow_affected,
     compute_cvss_v3_base_score,
     extract_purls_from_sbom,
     merge_findings,
     pick_highest_fix_version,
     query_cve_now_batch,
-    resolve_upstream_github_repo,
+    scan_local_trivy_fs,
+    scan_local_trivy_image,
 )
 
 
@@ -209,27 +211,121 @@ class TestBug5PickHighestFixVersion(unittest.TestCase):
         self.assertEqual(fix, "1.26.18")
 
 
-class TestBug6NoBlindRepoOrEcosystemGuessing(unittest.TestCase):
-    """Bug #6: Do not guess GitHub org/repo from non-ghcr registry paths when OCI labels are missing."""
+class TestBug6NoBlindRepoGuessingAndLocalTrivyFallback(unittest.TestCase):
+    """Bug #6: Never mark an unindexed image clean via GitHub repo guessing; fall back to local Trivy or mark unscanned."""
 
-    def test_resolve_upstream_github_repo_requires_oci_label_on_dockerhub(self) -> None:
-        ref = parse_image_ref("docker.io/company/internal-service:1.2.3")
+    def test_unindexed_image_without_local_trivy_reports_unscanned(self) -> None:
+        ref = parse_image_ref("ghcr.io/berriai/litellm:v1.103.2")
         assert ref is not None
-        with mock.patch("regscout.scanners._oci_registry_get", return_value={"annotations": {}}):
-            repo = resolve_upstream_github_repo(ref)
-        self.assertIsNone(repo)
+        res = ImageScanResult(
+            image=ref.raw,
+            registry=ref.registry,
+            repository=ref.repository,
+            tag=ref.tag,
+            digest=ref.digest,
+        )
+        with mock.patch("regscout.scanners.shutil.which", return_value=None):
+            ok = scan_local_trivy_image(ref, res, quiet=True)
+        self.assertFalse(ok)
+        self.assertEqual(res.status, "unscanned")
+        self.assertEqual(res.scanners_used, [])
+        self.assertTrue(any("brew install trivy" in n for n in res.notes))
 
-    def test_resolve_upstream_github_repo_uses_oci_source_label(self) -> None:
-        ref = parse_image_ref("docker.io/company/internal-service:v1.2.3")
+    def test_unindexed_image_with_local_trivy_scans_os_and_lang_packages(self) -> None:
+        ref = parse_image_ref("ghcr.io/berriai/litellm:v1.103.2")
         assert ref is not None
-        mock_manifest = {
-            "annotations": {
-                "org.opencontainers.image.source": "https://github.com/actual-org/actual-repo.git"
+        res = ImageScanResult(
+            image=ref.raw,
+            registry=ref.registry,
+            repository=ref.repository,
+            tag=ref.tag,
+            digest=ref.digest,
+        )
+        mock_trivy_json = json.dumps(
+            {
+                "Metadata": {
+                    "RepoDigests": [
+                        "ghcr.io/berriai/litellm@sha256:6b215d3eb4693622bd81ca68049a16f71099e772409f44d38da66ad9f73774a0"
+                    ]
+                },
+                "Results": [
+                    {
+                        "Target": "ghcr.io/berriai/litellm:v1.103.2 (wolfi 20230201)",
+                        "Class": "os-pkgs",
+                        "Type": "wolfi",
+                        "Vulnerabilities": [
+                            {
+                                "VulnerabilityID": "CVE-2026-111497",
+                                "PkgName": "libbrotlidec1",
+                                "InstalledVersion": "1.2.0-r5",
+                                "FixedVersion": "1.2.0-r7",
+                                "Severity": "HIGH",
+                                "Title": "Out-of-Bounds Write in Brotli Decoder (Node2Shell)",
+                                "CVSS": {"nvd": {"V3Score": 9.2}},
+                            }
+                        ],
+                    }
+                ],
             }
-        }
-        with mock.patch("regscout.scanners._oci_registry_get", return_value=mock_manifest):
-            repo = resolve_upstream_github_repo(ref)
-        self.assertEqual(repo, "actual-org/actual-repo")
+        )
+        fake_proc = mock.Mock(returncode=0, stdout=mock_trivy_json, stderr="")
+        with mock.patch("regscout.scanners.shutil.which", return_value="/opt/homebrew/bin/trivy"):
+            with mock.patch("regscout.scanners.subprocess.run", return_value=fake_proc):
+                ok = scan_local_trivy_image(ref, res, quiet=True)
+        self.assertTrue(ok)
+        self.assertEqual(res.status, "ok")
+        self.assertEqual(res.scanners_used, ["trivy-local"])
+        self.assertEqual(
+            res.digest,
+            "sha256:6b215d3eb4693622bd81ca68049a16f71099e772409f44d38da66ad9f73774a0",
+        )
+        self.assertEqual(len(res.findings), 1)
+        self.assertEqual(res.findings[0].id, "CVE-2026-111497")
+        self.assertEqual(res.findings[0].package, "libbrotlidec1")
+        self.assertEqual(res.findings[0].fixed_by, "1.2.0-r7")
+        self.assertEqual(res.findings[0].cvss, 9.2)
+
+    def test_scan_local_trivy_fs_parses_packages_and_vulns(self) -> None:
+        mock_trivy_fs_json = json.dumps(
+            {
+                "Results": [
+                    {
+                        "Target": "yarn.lock",
+                        "Class": "lang-pkgs",
+                        "Type": "yarn",
+                        "Packages": [
+                            {
+                                "Name": "lodash",
+                                "Version": "4.17.20",
+                                "Relationship": "direct",
+                            }
+                        ],
+                        "Vulnerabilities": [
+                            {
+                                "VulnerabilityID": "CVE-2021-23337",
+                                "PkgName": "lodash",
+                                "InstalledVersion": "4.17.20",
+                                "FixedVersion": "4.17.21",
+                                "Severity": "HIGH",
+                                "Title": "Command Injection in lodash",
+                                "CVSS": {"ghsa": {"V3Score": 7.2}},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        fake_proc = mock.Mock(returncode=0, stdout=mock_trivy_fs_json, stderr="")
+        with mock.patch("regscout.scanners.shutil.which", return_value="/opt/homebrew/bin/trivy"):
+            with mock.patch("regscout.scanners.subprocess.run", return_value=fake_proc):
+                pkgs, warnings = scan_local_trivy_fs("yarn.lock", quiet=True)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(pkgs), 1)
+        self.assertEqual(pkgs[0].ecosystem, "npm")
+        self.assertEqual(pkgs[0].name, "lodash")
+        self.assertEqual(pkgs[0].version, "4.17.20")
+        self.assertEqual(len(pkgs[0].findings), 1)
+        self.assertEqual(pkgs[0].findings[0].id, "CVE-2021-23337")
 
 
 class TestBug7AuthLockfilesGoModSemver(unittest.TestCase):
@@ -464,6 +560,23 @@ class TestOsvAndSbomPipeline(unittest.TestCase):
         self.assertEqual(merged[0].id, "CVE-2023-32681")
         self.assertEqual(merged[0].cvss, 6.1)
         self.assertEqual(merged[0].fixed_by, "2.31.0")
+
+    def test_parse_osv_vuln_detail_promotes_upstream_cve_id(self) -> None:
+        wolfi_doc = {
+            "id": "CGA-xxxx-yyyy-zzzz",
+            "upstream": ["CVE-2026-111497"],
+            "summary": "Wolfi brotli security update",
+            "affected": [
+                {
+                    "package": {"name": "brotli", "ecosystem": "Wolfi"},
+                    "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.2.0-r7"}]}],
+                }
+            ],
+        }
+        finding = _parse_osv_vuln_detail(wolfi_doc, "brotli", "1.2.0-r5", source_label="oci-sbom-osv")
+        self.assertEqual(finding.id, "CVE-2026-111497")
+        self.assertIn("CGA-xxxx-yyyy-zzzz", finding.aliases)
+        self.assertEqual(finding.fixed_by, "1.2.0-r7")
 
 
 if __name__ == "__main__":

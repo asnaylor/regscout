@@ -1,4 +1,4 @@
-"""Remote vulnerability scanners for container registries, OCI SBOMs, OSV.dev, GitHub Advisories, and cve.now."""
+"""Remote vulnerability scanners for container registries, OCI SBOMs, OSV.dev, cve.now, and local Trivy fallback."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -36,11 +38,6 @@ OSV_ECOSYSTEM_MAP: Dict[str, str] = {
     "crates.io": "crates.io",
 }
 
-_GITHUB_URL_RE = re.compile(
-    r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git|/|$)",
-    re.IGNORECASE,
-)
-
 
 @dataclass
 class VulnerabilityFinding:
@@ -51,7 +48,7 @@ class VulnerabilityFinding:
     version: str
     fixed_by: Optional[str]
     title: str
-    source: str  # e.g. "harbor-trivy", "docker-scout", "quay-clair", "oci-sbom-osv", "osv.dev", "cve.now"
+    source: str  # e.g. "harbor-trivy", "docker-scout", "quay-clair", "oci-sbom-osv", "trivy-local", "osv.dev", "cve.now"
     aliases: List[str] = field(default_factory=list)
 
 
@@ -303,72 +300,6 @@ def pick_highest_fix_version(
         )
         return per_cve_minimal_fixes[-1][1]
     return raw_fallback[0] if raw_fallback else "unknown"
-
-
-def version_matches_ghsa_range(
-    version_str: str,
-    range_expr: str,
-    patched_expr: Optional[str] = None,
-) -> bool:
-    """Evaluate a GitHub Security Advisory `vulnerable_version_range` against `version_str`."""
-    target = _parse_semver_tuple(version_str)
-    if not target or not range_expr:
-        return False
-
-    or_groups = [g.strip() for g in range_expr.split(";") if g.strip()]
-    for group in or_groups:
-        comparators = re.findall(r"(<=|>=|<|>|=)\s*([vV]?\d[^\s,;]*)", group)
-        if not comparators:
-            tokens = [t.strip() for t in re.split(r",|\band\b", group) if t.strip()]
-            for tok in tokens:
-                vt = _parse_semver_tuple(tok)
-                if vt and vt[0] == target[0] and vt[1] == target[1] and _cmp_semver(target, vt) <= 0:
-                    return True
-            continue
-
-        all_match = True
-        has_upper_bound = False
-        for op, ver_tok in comparators:
-            if op in ("<", "<=", "="):
-                has_upper_bound = True
-            bound = _parse_semver_tuple(ver_tok)
-            if not bound:
-                all_match = False
-                break
-            cmp_val = _cmp_semver(target, bound)
-            if op == "<" and not (cmp_val < 0):
-                all_match = False
-            elif op == "<=" and not (cmp_val <= 0):
-                all_match = False
-            elif op == ">" and not (cmp_val > 0):
-                all_match = False
-            elif op == ">=" and not (cmp_val >= 0):
-                all_match = False
-            elif op == "=" and not (cmp_val == 0):
-                all_match = False
-            if not all_match:
-                break
-
-        if all_match and not has_upper_bound and patched_expr:
-            patched_tuples = [
-                pt
-                for pt in (
-                    _parse_semver_tuple(tok)
-                    for tok in re.findall(
-                        r"[vV]?\d+\.\d+(?:\.\d+)?(?:[-.][A-Za-z0-9.]+)?", patched_expr
-                    )
-                )
-                if pt is not None
-            ]
-            if patched_tuples:
-                max_patched = max(patched_tuples, key=lambda x: x[:3])
-                if _cmp_semver(target, max_patched) >= 0:
-                    all_match = False
-
-        if all_match:
-            return True
-
-    return False
 
 
 def _version_matches_cvenow_affected(ver_str: str, aff: Dict[str, Any]) -> bool:
@@ -1070,200 +1001,416 @@ def scan_oci_sbom_attestation(
 
 
 # ---------------------------------------------------------------------------
-# 5. OCI Source Labels -> GitHub Security Advisories
+# 5. Local Trivy CLI Fallback (`trivy image` and `trivy fs`)
 # ---------------------------------------------------------------------------
 
-def _extract_github_repo_from_dict(mapping: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not isinstance(mapping, dict):
+_TRIVY_TYPE_ECOSYSTEM_MAP: Dict[str, str] = {
+    "pip": "pypi",
+    "pipenv": "pypi",
+    "poetry": "pypi",
+    "uv": "pypi",
+    "python-pkg": "pypi",
+    "gomod": "go",
+    "gobinary": "go",
+    "npm": "npm",
+    "yarn": "npm",
+    "pnpm": "npm",
+    "node-pkg": "npm",
+    "cargo": "crates.io",
+    "bundler": "rubygems",
+    "gemspec": "rubygems",
+    "composer": "packagist",
+    "pom": "maven",
+    "gradle": "maven",
+    "jar": "maven",
+    "nuget": "nuget",
+    "dotnet-core": "nuget",
+    "packages-props": "nuget",
+    "cocoapods": "cocoapods",
+    "swift": "swift",
+    "hex": "hex",
+    "pub": "pub",
+}
+
+
+def _extract_trivy_cvss(vuln: Dict[str, Any]) -> Optional[float]:
+    """Extract the most authoritative CVSS score from a Trivy vulnerability object."""
+    cvss_map = vuln.get("CVSS")
+    if not isinstance(cvss_map, dict) or not cvss_map:
         return None
-    candidate_keys = (
-        "org.opencontainers.image.source",
-        "org.opencontainers.image.url",
-        "org.label-schema.vcs-url",
-        "vcs-url",
-    )
-    for k in candidate_keys:
-        val = mapping.get(k)
-        if isinstance(val, str):
-            m = _GITHUB_URL_RE.search(val)
-            if m:
-                return m.group(1)
-    for val in mapping.values():
-        if isinstance(val, str) and "github.com" in val.lower():
-            m = _GITHUB_URL_RE.search(val)
-            if m:
-                return m.group(1)
-    return None
 
+    sev_source = str(vuln.get("SeveritySource") or "").lower()
+    ordered_sources: List[str] = []
+    for preferred in (sev_source, "nvd", "ghsa", "redhat", "ubuntu", "wolfi", "chainguard"):
+        if preferred and preferred in cvss_map and preferred not in ordered_sources:
+            ordered_sources.append(preferred)
+    for k in cvss_map:
+        if k not in ordered_sources:
+            ordered_sources.append(k)
 
-def resolve_upstream_github_repo(
-    img: DiscoveredImage,
-    platform: str = "linux/amd64",
-) -> Optional[str]:
-    """Resolve the upstream GitHub `owner/repo` via verified OCI labels (or ghcr.io org/repo)."""
-    ref = img.digest or img.tag or "latest"
-    auth_header, _ = resolve_registry_auth(img.registry)
-    cached_bearer: List[Optional[str]] = [None]
-    target_os, _, target_arch = platform.partition("/")
-    target_os = target_os or "linux"
-    target_arch = target_arch or "amd64"
-
-    manifest_accept = (
-        "application/vnd.oci.image.index.v1+json, "
-        "application/vnd.oci.image.manifest.v1+json, "
-        "application/vnd.docker.distribution.manifest.list.v2+json, "
-        "application/vnd.docker.distribution.manifest.v2+json"
-    )
-    mdata = _oci_registry_get(
-        img.registry,
-        f"/v2/{img.repository}/manifests/{ref}",
-        manifest_accept,
-        auth_header=auth_header,
-        cached_bearer=cached_bearer,
-    )
-    if isinstance(mdata, dict):
-        gh_from_ann = _extract_github_repo_from_dict(mdata.get("annotations"))
-        if gh_from_ann:
-            return gh_from_ann
-
-        if "manifests" in mdata and isinstance(mdata.get("manifests"), list):
-            sub_digest = None
-            for sub in mdata["manifests"]:
-                plat = sub.get("platform") or {}
-                if plat.get("os") == target_os and plat.get("architecture") == target_arch:
-                    sub_digest = sub.get("digest")
-                    break
-            if not sub_digest and mdata["manifests"]:
-                sub_digest = mdata["manifests"][0].get("digest")
-            if sub_digest:
-                mdata = _oci_registry_get(
-                    img.registry,
-                    f"/v2/{img.repository}/manifests/{sub_digest}",
-                    manifest_accept,
-                    auth_header=auth_header,
-                    cached_bearer=cached_bearer,
-                )
-                if isinstance(mdata, dict):
-                    gh_from_sub = _extract_github_repo_from_dict(mdata.get("annotations"))
-                    if gh_from_sub:
-                        return gh_from_sub
-
-        if isinstance(mdata, dict):
-            cfg_digest = (mdata.get("config") or {}).get("digest")
-            if cfg_digest:
-                cfg_data = _oci_registry_get(
-                    img.registry,
-                    f"/v2/{img.repository}/blobs/{cfg_digest}",
-                    "application/vnd.oci.image.config.v1+json, application/json",
-                    auth_header=auth_header,
-                    cached_bearer=cached_bearer,
-                )
-                if isinstance(cfg_data, dict):
-                    labels = (cfg_data.get("config") or {}).get("Labels") or cfg_data.get(
-                        "container_config", {}
-                    ).get("Labels")
-                    gh_from_labels = _extract_github_repo_from_dict(labels)
-                    if gh_from_labels:
-                        return gh_from_labels
-
-        # Only fall back to repository path on ghcr.io when the manifest exists (namespace == GitHub owner/org)
-        if img.registry == "ghcr.io" and img.repository.count("/") == 1:
-            return img.repository
-    return None
-
-
-def scan_github_advisories_and_cvenow_candidates(
-    img: DiscoveredImage,
-    res: ImageScanResult,
-    platform: str = "linux/amd64",
-) -> List[Tuple[str, str, str]]:
-    """Query GitHub Security Advisories for an image's upstream repo and extract verified package specs."""
-    ver_t = _parse_semver_tuple(img.tag) if img.tag else None
-    if not img.tag or not ver_t:
-        return []
-
-    gh_repo = resolve_upstream_github_repo(img, platform=platform)
-    if not gh_repo:
-        return []
-
-    res.upstream_repo = f"https://github.com/{gh_repo}"
-    ver_clean = _format_semver_tuple(ver_t)
-    candidate_specs: Set[Tuple[str, str, str]] = set()
-
-    url = f"https://api.github.com/repos/{gh_repo}/security-advisories?per_page=100"
-    gh_headers: Dict[str, str] = {"Accept": "application/vnd.github+json"}
-    gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if gh_token:
-        gh_headers["Authorization"] = f"Bearer {gh_token.strip()}"
-
-    try:
-        advisories = _http_json(url, headers=gh_headers)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 403:
-            res.notes.append("GitHub API rate limit reached (set GITHUB_TOKEN to increase limit)")
-        return sorted(candidate_specs)
-    except Exception:
-        return sorted(candidate_specs)
-
-    if not isinstance(advisories, list):
-        return sorted(candidate_specs)
-
-    res.status = "ok"
-    res.scanners_used.append("github-advisories")
-    for adv in advisories:
-        if not isinstance(adv, dict):
+    for src in ordered_sources:
+        entry = cvss_map.get(src)
+        if not isinstance(entry, dict):
             continue
-        ghsa_id = adv.get("ghsa_id") or "GHSA-UNKNOWN"
-        cve_id = adv.get("cve_id")
-        primary_id = cve_id or ghsa_id
-        aliases = [ghsa_id] if cve_id else []
+        for score_key in ("V3Score", "V40Score", "V4Score", "V2Score"):
+            val = entry.get(score_key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    pass
+        vec = entry.get("V3Vector")
+        if isinstance(vec, str):
+            calc = compute_cvss_v3_base_score(vec)
+            if calc is not None:
+                return calc
+    return None
 
-        cvss_obj = adv.get("cvss") or {}
-        cvss_score = cvss_obj.get("score")
-        if cvss_score is None and cvss_obj.get("vector_string"):
-            cvss_score = compute_cvss_v3_base_score(cvss_obj.get("vector_string"))
-        sev = normalize_severity(adv.get("severity"), cvss_score)
-        summary = clean_description(adv.get("summary"), 160)
-        vulns = adv.get("vulnerabilities") or []
 
-        matched = False
-        patched_str: Optional[str] = None
-        matched_pkg_name: str = gh_repo.lower()
-        for v in vulns:
-            pkg_info = v.get("package") or {}
-            raw_eco = pkg_info.get("ecosystem") or ""
-            raw_name = (pkg_info.get("name") or "").strip()
-            norm_eco = normalize_ecosystem(raw_eco)
-            if norm_eco and raw_name and " " not in raw_name:
-                norm_pkg = raw_name.lower() if norm_eco == "pypi" else raw_name
-                candidate_specs.add((norm_eco, norm_pkg, ver_clean))
+def _parse_trivy_vulnerabilities(
+    results_list: List[Dict[str, Any]],
+    source_label: str = "trivy-local",
+) -> List[VulnerabilityFinding]:
+    """Convert Trivy JSON `Results[].Vulnerabilities[]` entries into `VulnerabilityFinding` objects."""
+    findings: List[VulnerabilityFinding] = []
+    seen: Set[Tuple[str, str, str]] = set()
 
-            vrange = v.get("vulnerable_version_range") or ""
-            pver = v.get("patched_versions") or v.get("first_patched_version")
-            if isinstance(pver, dict):
-                pver = pver.get("identifier")
-            if version_matches_ghsa_range(img.tag, vrange, pver):
-                matched = True
-                patched_str = pver
-                if raw_name and " " not in raw_name:
-                    matched_pkg_name = raw_name.lower() if norm_eco == "pypi" else raw_name
-                break
+    for target_res in results_list:
+        if not isinstance(target_res, dict):
+            continue
+        for v in target_res.get("Vulnerabilities") or []:
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get("VulnerabilityID") or "UNKNOWN")
+            pkg = str(v.get("PkgName") or "")
+            ver = str(v.get("InstalledVersion") or "")
+            fix_raw = v.get("FixedVersion")
+            fix = str(fix_raw).strip() if fix_raw else None
+            key = (vid, pkg, ver)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        if matched:
-            res.findings.append(
+            aliases = [
+                str(a)
+                for a in (v.get("VendorIDs") or [])
+                if a and str(a) != vid
+            ]
+            cvss = _extract_trivy_cvss(v)
+            sev = normalize_severity(v.get("Severity"), cvss)
+            desc = clean_description(v.get("Title") or v.get("Description"), 160)
+            findings.append(
                 VulnerabilityFinding(
-                    id=primary_id,
+                    id=vid,
                     severity=sev,
-                    cvss=float(cvss_score) if cvss_score is not None else None,
-                    package=matched_pkg_name,
-                    version=ver_clean,
-                    fixed_by=patched_str,
-                    title=summary or primary_id,
-                    source="github-advisories",
+                    cvss=cvss,
+                    package=pkg,
+                    version=ver,
+                    fixed_by=fix,
+                    title=desc or vid,
+                    source=source_label,
                     aliases=aliases,
                 )
             )
-    return sorted(candidate_specs)
+    return findings
+
+
+def _extract_trivy_purls(
+    results_list: List[Dict[str, Any]],
+) -> List[Tuple[str, str, str]]:
+    """Extract `(purl, pkg_name, pkg_version)` tuples (including OS source package PURLs) from Trivy Results."""
+    purl_tuples: List[Tuple[str, str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for target_res in results_list:
+        if not isinstance(target_res, dict):
+            continue
+        for pkg in target_res.get("Packages") or []:
+            if not isinstance(pkg, dict):
+                continue
+            pname = str(pkg.get("Name") or "").strip()
+            pver = str(pkg.get("Version") or "").strip()
+            purl = str((pkg.get("Identifier") or {}).get("PURL") or "").strip()
+            if not purl or not pname:
+                continue
+            if (purl, pname) not in seen:
+                seen.add((purl, pname))
+                purl_tuples.append((purl, pname, pver))
+
+            # Distro OSV advisories (Wolfi/Chainguard, Alpine, Debian, Ubuntu) are indexed by source package name
+            src_name = str(pkg.get("SrcName") or "").strip()
+            src_ver = str(pkg.get("SrcVersion") or pver).strip()
+            if (
+                src_name
+                and src_name != pname
+                and purl.startswith(("pkg:apk/", "pkg:deb/", "pkg:rpm/"))
+                and f"/{pname}@" in purl
+            ):
+                prefix, _, suffix = purl.partition(f"/{pname}@")
+                q_part = ("?" + suffix.split("?", 1)[1]) if "?" in suffix else ""
+                src_purl = f"{prefix}/{src_name}@{urllib.parse.quote(src_ver, safe='.-_+')}{q_part}"
+                if (src_purl, pname) not in seen:
+                    seen.add((src_purl, pname))
+                    purl_tuples.append((src_purl, pname, pver))
+
+    return purl_tuples
+
+
+def scan_local_trivy_image(
+    img: DiscoveredImage,
+    res: ImageScanResult,
+    platform: str = "linux/amd64",
+    scan_timeout: int = 300,
+    quiet: bool = False,
+    allow_local_trivy: bool = True,
+) -> bool:
+    """Fallback to local `trivy image` (+ OSV.dev PURL enrichment) when an image has no registry scan or OCI SBOM."""
+    if not allow_local_trivy:
+        if res.status not in ("auth_required", "not_found", "error"):
+            res.status = "unscanned"
+        res.notes.append(
+            "No registry scanner API or OCI SBOM attestation found (--no-local-trivy disabled local Trivy fallback)"
+        )
+        return False
+
+    trivy_bin = shutil.which("trivy")
+    if not trivy_bin:
+        if res.status not in ("auth_required", "not_found", "error"):
+            res.status = "unscanned"
+        res.notes.append(
+            "No registry scanner API or OCI SBOM attestation found, and local 'trivy' binary is not installed "
+            "(install with `brew install trivy` to scan unindexed images)"
+        )
+        return False
+
+    if not quiet:
+        print(
+            f"[regscout] No registry scan or OCI SBOM for {img.raw}; running local 'trivy image' scan...",
+            file=sys.stderr,
+        )
+
+    cmd = [
+        trivy_bin,
+        "image",
+        "--scanners",
+        "vuln",
+        "--list-all-pkgs",
+        "--format",
+        "json",
+        "--quiet",
+        "--platform",
+        platform,
+        img.raw,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=scan_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        if res.status not in ("auth_required", "not_found", "error"):
+            res.status = "error"
+        res.notes.append(f"Local 'trivy image' timed out after {scan_timeout}s for {img.raw}")
+        return False
+    except Exception as exc:
+        if res.status not in ("auth_required", "not_found", "error"):
+            res.status = "error"
+        res.notes.append(f"Failed to execute local 'trivy image': {exc}")
+        return False
+
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        err_text = clean_description(proc.stderr or proc.stdout or f"exit code {proc.returncode}", 200)
+        err_upper = err_text.upper()
+        if any(tok in err_upper for tok in ("UNAUTHORIZED", "401", "403", "DENIED", "AUTHENTICATION")):
+            res.status = "auth_required"
+        elif any(tok in err_upper for tok in ("MANIFEST_UNKNOWN", "NAME_UNKNOWN", "NOT FOUND", "404")):
+            res.status = "not_found"
+        elif res.status not in ("auth_required", "not_found"):
+            res.status = "error"
+        res.notes.append(f"Local 'trivy image' failed: {err_text}")
+        return False
+
+    try:
+        data = json.loads(proc.stdout)
+    except Exception as exc:
+        res.status = "error"
+        res.notes.append(f"Failed to parse local 'trivy image' JSON output: {exc}")
+        return False
+
+    if not isinstance(data, dict):
+        res.status = "error"
+        res.notes.append("Unexpected JSON root from local 'trivy image'")
+        return False
+
+    metadata = data.get("Metadata") or {}
+    if not res.digest and isinstance(metadata, dict):
+        for rd in metadata.get("RepoDigests") or []:
+            if isinstance(rd, str) and "@sha256:" in rd:
+                res.digest = "sha256:" + rd.split("@sha256:", 1)[1]
+                break
+
+    results_list = data.get("Results") or []
+    trivy_findings = _parse_trivy_vulnerabilities(results_list, source_label="trivy-local")
+
+    # Cross-check extracted OS/language PURLs against live OSV.dev so 0-day distro advisories
+    # published after the last Trivy DB snapshot are still caught immediately.
+    purl_tuples = _extract_trivy_purls(results_list)
+    osv_findings: List[VulnerabilityFinding] = []
+    if purl_tuples:
+        osv_findings, _ = query_osv_purls(purl_tuples, source_label="osv.dev")
+
+    res.status = "ok"
+    res.scanners_used.append("trivy-local")
+    if osv_findings:
+        res.scanners_used.append("osv.dev")
+        # Group by (package, version) before merging so same CVE on different subpackages isn't collapsed prematurely
+        by_pkg: Dict[Tuple[str, str], Tuple[List[VulnerabilityFinding], List[VulnerabilityFinding]]] = {}
+        for f in trivy_findings:
+            by_pkg.setdefault((f.package, f.version), ([], []))[0].append(f)
+        for f in osv_findings:
+            by_pkg.setdefault((f.package, f.version), ([], []))[1].append(f)
+        for _k, (t_list, o_list) in by_pkg.items():
+            res.findings.extend(merge_findings(t_list, o_list))
+    else:
+        res.findings.extend(trivy_findings)
+    return True
+
+
+def scan_local_trivy_fs(
+    target_path: str,
+    scan_timeout: int = 180,
+    quiet: bool = False,
+) -> Tuple[List[PackageScanResult], List[str]]:
+    """Scan a directory or third-party lockfile via `trivy fs --scanners vuln --format json`."""
+    trivy_bin = shutil.which("trivy")
+    if not trivy_bin:
+        raise ValueError(
+            f"Unsupported lockfile or directory '{target_path}' for built-in parser "
+            "(supported built-in lockfiles: go.mod, *requirements*.txt, constraints*.txt, "
+            "uv.lock, poetry.lock, package-lock.json, Cargo.lock; or install `trivy` via `brew install trivy`)"
+        )
+
+    if not quiet:
+        print(
+            f"[regscout] Running local 'trivy fs' vulnerability scan on {target_path}...",
+            file=sys.stderr,
+        )
+
+    cmd = [
+        trivy_bin,
+        "fs",
+        "--scanners",
+        "vuln",
+        "--format",
+        "json",
+        "--quiet",
+        target_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=scan_timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return [
+            PackageScanResult(
+                ecosystem="trivy-fs",
+                name=os.path.basename(os.path.abspath(target_path)) or target_path,
+                version="unknown",
+                source=target_path,
+                direct=True,
+                status="error",
+                notes=[f"Local 'trivy fs' failed: {exc}"],
+            )
+        ], []
+
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        err_text = clean_description(proc.stderr or proc.stdout or f"exit code {proc.returncode}", 200)
+        return [
+            PackageScanResult(
+                ecosystem="trivy-fs",
+                name=os.path.basename(os.path.abspath(target_path)) or target_path,
+                version="unknown",
+                source=target_path,
+                direct=True,
+                status="error",
+                notes=[f"Local 'trivy fs' failed: {err_text}"],
+            )
+        ], []
+
+    try:
+        data = json.loads(proc.stdout)
+    except Exception as exc:
+        return [
+            PackageScanResult(
+                ecosystem="trivy-fs",
+                name=os.path.basename(os.path.abspath(target_path)) or target_path,
+                version="unknown",
+                source=target_path,
+                direct=True,
+                status="error",
+                notes=[f"Failed to parse 'trivy fs' JSON: {exc}"],
+            )
+        ], []
+
+    results_list = data.get("Results") or []
+    if not results_list:
+        warnings = [
+            f"Local 'trivy fs' found no supported dependency lockfiles in '{target_path}'"
+        ]
+        return [], warnings
+
+    pkg_map: Dict[Tuple[str, str, str], PackageScanResult] = {}
+    for target_res in results_list:
+        if not isinstance(target_res, dict):
+            continue
+        raw_type = str(target_res.get("Type") or "").lower()
+        eco = _TRIVY_TYPE_ECOSYSTEM_MAP.get(raw_type, raw_type or "unknown")
+        target_label = str(target_res.get("Target") or os.path.basename(target_path))
+
+        for pkg in target_res.get("Packages") or []:
+            if not isinstance(pkg, dict):
+                continue
+            rel = str(pkg.get("Relationship") or "").lower()
+            if rel == "root":
+                continue
+            pname = str(pkg.get("Name") or "").strip()
+            pver = str(pkg.get("Version") or "").strip().lstrip("vV")
+            if not pname or not pver:
+                continue
+            key = (eco, pname, pver)
+            if key not in pkg_map:
+                pkg_map[key] = PackageScanResult(
+                    ecosystem=eco,
+                    name=pname,
+                    version=pver,
+                    source=target_label,
+                    direct=(rel != "indirect"),
+                    status="ok",
+                )
+
+        findings = _parse_trivy_vulnerabilities([target_res], source_label="trivy-local")
+        for f in findings:
+            clean_ver = f.version.strip().lstrip("vV")
+            key = (eco, f.package, clean_ver)
+            if key not in pkg_map:
+                pkg_map[key] = PackageScanResult(
+                    ecosystem=eco,
+                    name=f.package,
+                    version=clean_ver,
+                    source=target_label,
+                    direct=True,
+                    status="ok",
+                )
+            pkg_map[key].findings.append(f)
+
+    return list(pkg_map.values()), []
 
 
 # ---------------------------------------------------------------------------
@@ -1277,8 +1424,14 @@ def _parse_osv_vuln_detail(
     source_label: str = "osv.dev",
 ) -> VulnerabilityFinding:
     raw_id = vuln.get("id") or "UNKNOWN"
-    raw_aliases = [str(a) for a in (vuln.get("aliases") or []) if a]
-    # Prefer CVE-* as primary display ID if present in aliases
+    raw_aliases = list(
+        dict.fromkeys(
+            str(a)
+            for a in ((vuln.get("aliases") or []) + (vuln.get("upstream") or []))
+            if a
+        )
+    )
+    # Prefer CVE-* as primary display ID if present in aliases or upstream
     cve_aliases = [a for a in raw_aliases if a.upper().startswith("CVE-")]
     if not raw_id.upper().startswith("CVE-") and cve_aliases:
         primary_id = cve_aliases[0]
@@ -1302,22 +1455,37 @@ def _parse_osv_vuln_detail(
 
     db_sev = (vuln.get("database_specific") or {}).get("severity")
     fixed_versions: List[str] = []
+    fallback_fixed: List[str] = []
+    fallback_db_sev: Optional[str] = None
     for aff in vuln.get("affected") or []:
         if not isinstance(aff, dict):
             continue
         aff_pkg = (aff.get("package") or {}).get("name") or ""
-        if aff_pkg and pkg_name and aff_pkg.lower() != pkg_name.lower():
-            continue
-        if not db_sev:
-            db_sev = (aff.get("database_specific") or {}).get("severity") or (
-                aff.get("ecosystem_specific") or {}
-            ).get("severity")
+        aff_sev = (aff.get("database_specific") or {}).get("severity") or (
+            aff.get("ecosystem_specific") or {}
+        ).get("severity")
+        if not fallback_db_sev and aff_sev:
+            fallback_db_sev = aff_sev
+        aff_fixes: List[str] = []
         for rng in aff.get("ranges") or []:
             if not isinstance(rng, dict):
                 continue
             for ev in rng.get("events") or []:
                 if isinstance(ev, dict) and ev.get("fixed"):
-                    fixed_versions.append(str(ev["fixed"]))
+                    aff_fixes.append(str(ev["fixed"]))
+        fallback_fixed.extend(aff_fixes)
+        if aff_pkg and pkg_name and aff_pkg.lower() != pkg_name.lower():
+            continue
+        if not db_sev and aff_sev:
+            db_sev = aff_sev
+        fixed_versions.extend(aff_fixes)
+
+    if not fixed_versions and fallback_fixed:
+        # When an OS binary subpackage (e.g. libbrotlidec1) matched via its source package PURL (brotli),
+        # use the source package's fixed_versions from the distro advisory.
+        fixed_versions = fallback_fixed
+    if not db_sev and fallback_db_sev:
+        db_sev = fallback_db_sev
 
     dedup_fixed = list(dict.fromkeys(fixed_versions))
     fixed_by = ", ".join(dedup_fixed) if dedup_fixed else None
@@ -1338,7 +1506,7 @@ def _parse_osv_vuln_detail(
 
 
 def _hydrate_osv_ids(vuln_ids: Set[str]) -> Dict[str, Dict[str, Any]]:
-    """Fetch full OSV vulnerability records concurrently for unique matched IDs."""
+    """Fetch full OSV vulnerability records concurrently for unique matched IDs (plus upstream enrichment for distro stubs)."""
     if not vuln_ids:
         return {}
     details: Dict[str, Dict[str, Any]] = {}
@@ -1357,6 +1525,39 @@ def _hydrate_osv_ids(vuln_ids: Set[str]) -> Dict[str, Dict[str, Any]]:
         for vid, doc in pool.map(_fetch_one, sorted(vuln_ids)):
             if doc:
                 details[vid] = doc
+
+        # Distro advisories (e.g. Wolfi/Chainguard CGA-*, Alpine, Debian) often omit severity/summary
+        # and point to upstream GHSA-*/CVE-* records that carry the canonical description and severity.
+        upstream_to_fetch: Set[str] = set()
+        for doc in details.values():
+            has_sev = bool(doc.get("severity") or (doc.get("database_specific") or {}).get("severity"))
+            has_desc = bool(doc.get("summary") or doc.get("details"))
+            if not has_sev or not has_desc:
+                for up_id in doc.get("upstream") or []:
+                    if isinstance(up_id, str) and up_id not in details:
+                        upstream_to_fetch.add(up_id)
+
+        if upstream_to_fetch:
+            upstream_docs: Dict[str, Dict[str, Any]] = {}
+            for up_id, up_doc in pool.map(_fetch_one, sorted(upstream_to_fetch)):
+                if up_doc:
+                    upstream_docs[up_id] = up_doc
+
+            for doc in details.values():
+                for up_id in doc.get("upstream") or []:
+                    up_doc = upstream_docs.get(up_id) or details.get(up_id)
+                    if not up_doc:
+                        continue
+                    if not doc.get("summary") and up_doc.get("summary"):
+                        doc["summary"] = up_doc["summary"]
+                    if not doc.get("details") and up_doc.get("details"):
+                        doc["details"] = up_doc["details"]
+                    if not doc.get("severity") and up_doc.get("severity"):
+                        doc["severity"] = up_doc["severity"]
+                    up_db_sev = (up_doc.get("database_specific") or {}).get("severity")
+                    if up_db_sev and not (doc.get("database_specific") or {}).get("severity"):
+                        doc.setdefault("database_specific", {})["severity"] = up_db_sev
+
     return details
 
 
