@@ -1,45 +1,48 @@
 # Agent Guide: `regscout`
 
-`regscout` is a zero-pull, zero-dependency Python CLI tool that scans explicit **container images** (`--image`), **dependency lockfiles** (`--lockfile`), and/or **individual packages** (`--pkg`) for CVEs.
+`regscout` is a zero-dependency Python CLI that scans explicit **container images**, **dependency lockfiles** (`--lockfile`), and/or **individual packages** (`--pkg`) for CVEs. It does **not** crawl directories: pass exactly the targets you want checked, in any combination.
 
-It does **not** crawl directories automatically—pass the exact images, lockfiles, or package specs you want to check in any combination.
+Install and examples are in [`README.md`](README.md); all CLI options, supported lockfiles/registries, exit codes, and how each scanner works are in [`docs.md`](docs.md). This file covers only what an agent needs to run it and read the result.
 
 ---
 
-## 1. Agent Workflow
+## 1. Workflow
 
 1. **Identify targets** in the user's project or cluster:
-   - Container images from `Dockerfile` (`FROM ...`), Kubernetes manifests (`image: ...`), or `kubectl get pods`.
-   - Lockfiles (`go.mod`, `requirements.txt`, `uv.lock`, `poetry.lock`, `package-lock.json`, `Cargo.lock`) or individual packages (`pypi:name@ver`, `go:module@ver`, `npm:pkg@ver`, `crates.io:crate@ver`).
-2. **Run `regscout` with `--format json`** (all three target types work standalone or combined):
+   - Images: `FROM` lines in `Dockerfile`s, `image:` fields in Kubernetes manifests or Helm values, or `kubectl get pods -A -o jsonpath='{..image}'`.
+   - Lockfiles: `go.mod`, `requirements.txt`, `uv.lock`, `poetry.lock`, `package-lock.json`, `Cargo.lock` (plus directories and `yarn.lock`, `pnpm-lock.yaml`, `Gemfile.lock`, `composer.lock`, `pom.xml`, etc. when `trivy` is installed).
+   - Packages: `pypi:name@ver`, `go:module@ver`, `npm:pkg@ver`, `crates.io:crate@ver`.
+2. **Run with `--format json`** (targets work standalone or combined):
    ```bash
-   # Images + Lockfiles together
    regscout \
-     --image registry.nersc.gov/example/test-image:0.4.0 \
+     --image postgres:16 \
      --image ghcr.io/berriai/litellm:main-v1.60.0-stable \
      --lockfile ./requirements.txt \
-     --lockfile ./go.mod \
+     --pkg pypi:pyjwt@2.10.0 \
      --format json --min-severity high
-
-   # Lockfiles only (no image required)
-   regscout --lockfile requirements.txt --format json --min-severity high
-
-   # Specific packages only (no image or file required)
-   regscout --pkg pypi:pyjwt@2.10,pypi:flask@2.2.2 --format json
    ```
-3. **Digest & Triage**:
-   - Check `summary.incomplete_images`, `summary.incomplete_packages`, and `summary.errors` first—never assume an image with `status != "ok"` is clean.
-   - Prioritize findings where `fixed_by` is non-null (`--fixable-only` filters to only fixable CVEs).
-   - Recommend concrete version bumps in the relevant `Dockerfile`, Kubernetes YAML, or lockfile.
+   For private registries the user must have run `docker login` / `podman login`; `regscout` reads those credentials.
+3. **Check completeness first.** If `summary.incomplete_images`, `summary.incomplete_packages`, or `summary.errors` is non-empty, say which targets weren't scanned and why (`images[].status`, `images[].notes`). Never describe a target with `status != "ok"` as clean.
+4. **Triage and recommend.** Prioritize by severity, then findings with a non-null `fixed_by` (`--fixable-only` filters to these). Propose concrete version bumps in the relevant `Dockerfile`, Kubernetes YAML, or lockfile, and mention findings with no fix.
+
+An image that only exists in the local Docker daemon can't be scanned; suggest pushing it, or scan its lockfiles and base image instead.
 
 ---
 
-## 2. How `regscout` Scans
+## 2. JSON output
 
-1. **Native Registry Scanners (Zero-Pull)**:
-   - **Harbor v2 (`registry.nersc.gov`, etc.)**: Verifies Harbor v2 via `/api/v2.0/systeminfo`, queries Trivy `scan_overview` via Harbor REST API v2 using local Podman/Docker credentials (`~/.config/containers/auth.json` or `~/.docker/config.json`), and **auto-triggers a scan (`POST .../scan`) if unscanned**.
-   - **Red Hat Quay (`quay.io`)**: Resolves multi-arch manifest lists to `--platform` (default `linux/amd64`) and queries Quay's Clair v4 `/security?vulnerabilities=true` endpoint.
-   - **Docker Hub (`docker.io`)**: Resolves the `--platform` digest and queries Docker Scout GraphQL (`https://api.dso.docker.com/v1/graphql`).
-2. **Zero-Pull OCI SBOM Attestation (`oci-sbom-osv`)**: For registries without native scan APIs (like `ghcr.io`, `gcr.io`, `registry.k8s.io`), inspects the OCI Image Index for BuildKit/in-toto SPDX or CycloneDX SBOM attestations, extracts all OS and language PURLs, and batch-queries **[OSV.dev](https://osv.dev)**.
-3. **Local Trivy Fallback (`trivy-local` + `osv.dev`)**: If an image has neither a native registry scanner nor an attached OCI SBOM attestation, `regscout` never guesses based on GitHub repository names. If `trivy` is installed locally (`shutil.which("trivy")`), `regscout` runs `trivy image --scanners vuln --list-all-pkgs --format json --quiet` and cross-checks extracted OS/language PURLs (including source package PURLs) against live `OSV.dev`. If `trivy` is not installed (or `--no-local-trivy` is set), `regscout` marks the image `status = "unscanned"` and recommends installing `trivy` (`brew install trivy`).
-4. **Lockfiles & `--pkg` via `OSV.dev` + `cve.now` (with `trivy fs` fallback)**: Queries both `https://api.osv.dev/v1/querybatch` and `https://cve.now/stack` and merges/deduplicates findings by CVE/GHSA/upstream alias. Falls back to `trivy fs --scanners vuln` when `--lockfile` is passed a directory or third-party lockfile (`yarn.lock`, `pnpm-lock.yaml`, `Gemfile.lock`, `composer.lock`, `pom.xml`, etc.).
+```text
+summary:  images_scanned, incomplete_images, packages_scanned, incomplete_packages,
+          total_findings, fixable_findings, by_severity{CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN},
+          errors[], warnings[]
+images[]: image, registry, repository, tag, digest, status, notes[], scanners_used[],
+          scan_triggered, auth_source, findings[]
+vulnerable_packages[]: ecosystem, name, version, source, direct, status, notes[], findings[]
+findings[]: id, severity, cvss, package, version, fixed_by, title, source, aliases[]
+```
+
+- `images[].status`: `ok`, `auth_required`, `not_found`, `unscanned`, `error`. `vulnerable_packages[].status`: `ok` or `error`.
+- `scanners_used` / `findings[].source` values: `harbor-trivy`, `quay-clair`, `docker-scout`, `oci-sbom-osv`, `trivy-local`, `osv.dev`, `cve.now`.
+- `scan_triggered`: `true` if `regscout` started a Harbor scan and waited for it.
+- `fixed_by`: version(s) that resolve the CVE, or `null` if no upstream fix exists.
+- `warnings` includes skipped `requirements.txt` lines that aren't exact `==` pins.

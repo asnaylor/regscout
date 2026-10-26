@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "regscout"
 version = "0.1.0"
-description = "Zero-pull container & dependency CVE scanner powered by registry APIs (Harbor, Quay, Docker Scout), GitHub Security Advisories, and cve.now"
+description = "Zero-pull container & dependency CVE scanner powered by registry APIs (Harbor, Quay, Docker Scout), OCI SBOM attestations, OSV.dev, and cve.now"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

@@ -22,7 +22,7 @@ Use `regscout` whenever you need to audit container images, Kubernetes deploymen
 ```bash
 # Full JSON output for agent analysis
 regscout \
-  --image registry.nersc.gov/example/test-image:0.4.0 \
+  --image registry.nersc.gov/library/nersc/tensorflow:ngc-24.05-v1 \
   --image quay.io/prometheus/prometheus:v2.55.1 \
   --lockfile ./requirements.txt \
   --format json --min-severity high

@@ -1,97 +1,124 @@
 # regscout
 
-**Zero-pull container & dependency CVE scanner for humans and AI coding agents.**
+**Find known vulnerabilities in container images, lockfiles, and packages, from your terminal or your AI coding agent.**
 
-`regscout` checks container images (`--image`), dependency lockfiles (`--lockfile`), and individual packages (`--pkg`) for known vulnerabilities **without pulling a single container layer locally** and **without noisy directory crawling**. You (or your AI agent) pass the exact images, lockfiles, or packages you want to check—either standalone or combined in one command.
+Point `regscout` at the images you run (or build), the lockfiles in your repo, or individual packages. It reports each CVE with a severity, the installed version, and the version that fixes it. It reads scan results that registries already have, so for most images **nothing is pulled and no Docker daemon is needed**.
 
----
+**Built for agents as well as humans.** Run it yourself, or ask your coding agent (Claude Code, Codex, Cursor, ...) to run it. Agents get structured `--format json` output that never reports an unscanned target as clean, plus a ready-made [skill](skills/regscout/SKILL.md) and [`AGENTS.md`](AGENTS.md). For example:
 
-## How the Pipeline Works
+> Use regscout to scan the images in my `k8s/` manifests and my `requirements.txt`, and tell me which versions to upgrade to.
 
-1. **Native Registry Scanners (Zero-Pull)**
-   - **Harbor v2 Registries (Trivy)** — e.g. NERSC Harbor (`registry.nersc.gov`). Verifies Harbor v2 via `/api/v2.0/systeminfo`, checks `scan_overview`, and **if the image has not been scanned yet, automatically triggers a remote Trivy scan (`POST .../scan`) and polls until the report completes**.
-   - **Red Hat Quay (`quay.io` Clair v4)** — Resolves multi-arch manifest lists to `--platform` (default `linux/amd64`) and fetches OS + language layer findings.
-   - **Docker Hub (`docker.io` Docker Scout GraphQL)** — Queries `api.dso.docker.com/v1/graphql` for indexed SBOM packages, CVEs, CVSS scores, and `fixedBy` versions.
-2. **Zero-Pull OCI SBOM Attestation Scanner (`oci-sbom-osv`)** — When a registry has no native vulnerability API (such as `ghcr.io`, `gcr.io`, `registry.k8s.io`, or a generic OCI v2 registry), `regscout` inspects the OCI Image Index for BuildKit / in-toto SBOM attestations (`vnd.docker.reference.type: "attestation-manifest"` with SPDX or CycloneDX predicates), streams only the JSON SBOM blob, extracts every OS (`apk`, `deb`, `rpm`) and language (`pypi`, `golang`, `npm`, `cargo`) Package URL (`purl`), and batch-queries **[OSV.dev](https://osv.dev)** (`/v1/querybatch` + `/v1/vulns/<id>`).
-3. **Local Trivy Fallback (`trivy-local`)** — If an image has neither a native registry scanner nor an attached OCI SBOM attestation (common on `ghcr.io` images built without `--sbom=true`), `regscout` never guesses based on repository names. Instead, if [`trivy`](https://trivy.dev) is installed locally (`shutil.which("trivy")`), `regscout` automatically runs `trivy image --scanners vuln --format json --quiet` to inspect both OS packages (`apk`, `dpkg`, `rpm`) and application virtualenvs/layers. If `trivy` is not installed (or `--no-local-trivy` is passed), `regscout` marks the image `⚠ [unscanned]` and recommends installing `trivy` (`brew install trivy`).
-4. **Lockfiles (`--lockfile`) & Packages (`--pkg`) via `OSV.dev` + `cve.now` (with `trivy fs` fallback)** — Parses `go.mod`, `requirements.txt`, `uv.lock`, `poetry.lock`, `package-lock.json`, or `Cargo.lock` (or individual `eco:name@version` specs) and queries both **Google OSV.dev** and **cve.now** in batches, deduplicating via CVE/GHSA/upstream aliases and calculating CVSS v3.1 base scores from vector strings when needed. If `--lockfile` is given a directory or third-party lockfile (`yarn.lock`, `pnpm-lock.yaml`, `Gemfile.lock`, `composer.lock`, `pom.xml`, etc.) and `trivy` is installed locally, `regscout` falls back to `trivy fs --scanners vuln`.
-
----
-
-## Features
-
-- **Zero external dependencies**: Pure Python 3.9+ standard library (`urllib.request`, `json`, `tomllib`, `argparse`).
-- **Fail-safe error reporting**: Unscanned, unauthorized, or missing targets are flagged with `⚠ Scan incomplete` (and exit code `3` when `--fail-on-error` or `--fail-on` is set)—never silently reported as clean.
-- **Smart branch-aware upgrade recommendations**: Recommends the minimal patched version on your installed release branch per CVE, then the highest required version across all CVEs for each package.
-- **Podman & Docker credential support**: Automatically reads credentials from Podman (`$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json`, `~/.config/containers/auth.json`) and Docker (`$DOCKER_CONFIG/config.json`, `~/.docker/config.json`), including `credHelpers` and `credsStore` and Docker Hub hostname aliases (`index.docker.io`, `registry-1.docker.io`, `docker.io`). Never prints or logs secret values.
-- **Agent-ready**: Ships with [`AGENTS.md`](AGENTS.md), [`CLAUDE.md`](CLAUDE.md), and [`skills/regscout/SKILL.md`](skills/regscout/SKILL.md) for Claude Code, OpenAI Codex, Google Antigravity, and Cursor.
-
----
-
-## Installation
+See [With an AI agent](#with-an-ai-agent) for setup.
 
 ```bash
-# Install globally as a CLI tool with uv or pipx
-uv tool install .
-# or editable install
-pip install -e .
+regscout postgres:16 quay.io/prometheus/prometheus:v2.55.1 --min-severity critical
+```
 
-# Or run directly without installing
+```text
+✗ postgres:16  [docker-scout]
+  Summary  : 4 total (4 fixable) — 4 CRITICAL
+  Recommended Upgrades:
+    • stdlib                     1.24.6 -> 1.26.9  (4 CRITICAL)
+  Fixable Findings:
+    SEV       CVSS  ID              PACKAGE       VERSION -> FIX     SUMMARY
+    CRITICAL  10.0  CVE-2025-68121  stdlib        1.24.6 -> 1.24.13  During session resumption in crypto/tls, if the…
+    ...
+
+✗ quay.io/prometheus/prometheus:v2.55.1  [quay-clair]
+  Summary  : 9 total (9 fixable) — 9 CRITICAL
+  Recommended Upgrades:
+    • golang.org/x/crypto        v0.26.0 -> 0.52.0  (8 CRITICAL)
+    • google.golang.org/grpc     v1.66.0 -> 1.79.3  (1 CRITICAL)
+  ...
+```
+
+Output is a snapshot; CVE data changes daily, so your results will differ.
+
+---
+
+## Install
+
+Requires Python 3.9+ and has no third-party dependencies.
+
+```bash
+git clone <this-repo> && cd regscout
+uv tool install .        # or: pipx install .   /   pip install -e .
+regscout --help
+
+# or run without installing
 python3 -m regscout --help
 ```
 
+> [!NOTE]
+> Trivy is optional but recommended. Without [`trivy`](https://trivy.dev) (`brew install trivy`), images that have no registry scan or SBOM attestation are reported `unscanned`. With it, `regscout` falls back to `trivy image`, which **downloads the image layers**. See [How it works](docs.md#how-it-works).
+
 ---
 
-## Usage
+## Quickstart
+
+```bash
+# Container images you use (positional or --image, any registry)
+regscout postgres:16 ghcr.io/berriai/litellm:main-v1.60.0-stable
+
+# A private NERSC Harbor image (log in first: `podman login registry.nersc.gov`)
+regscout registry.nersc.gov/library/nersc/tensorflow:ngc-24.05-v1 --min-severity high
+
+# Dependencies in your repo
+regscout --lockfile requirements.txt --lockfile go.mod --min-severity high
+
+# A package you're thinking of using, or want to double-check
+regscout --pkg pypi:pyjwt@2.10.0,npm:lodash@4.17.20 --min-severity high
+
+# Only show what you can actually fix
+regscout postgres:16 --fixable-only --min-severity high
+```
+
+Images, lockfiles, and packages can be combined in one command.
+
+The NERSC example above reports (scanned server-side by Harbor's Trivy, nothing pulled):
 
 ```text
-usage: regscout [-h] [-i IMAGE] [-l LOCKFILE] [-p PKG] [--platform PLATFORM]
-                [-f {text,json,markdown}] [--color {auto,always,never}]
-                [--no-color] [--min-severity {unknown,low,medium,high,critical}]
-                [--fixable-only] [--direct-only] [--no-trigger-scan]
-                [--scan-timeout SCAN_TIMEOUT]
-                [--fail-on {none,low,medium,high,critical}] [--fail-on-error]
-                [-q]
-                [images ...]
+! registry.nersc.gov/library/nersc/tensorflow:ngc-24.05-v1  [harbor-trivy]
+  Summary  : 2 total (2 fixable) — 2 HIGH
+  Recommended Upgrades:
+    • Newtonsoft.Json            12.0.3 -> 13.0.1  (1 HIGH)
+    • jupyterlab                 2.3.2 -> 3.0.8  (1 HIGH)
 ```
 
-### Exit Codes
+### Scanning images you built
 
-- `0` — Scan completed and no findings met `--fail-on` threshold.
-- `1` — One or more findings met or exceeded `--fail-on <severity>`.
-- `2` — CLI usage error or unsupported/missing `--lockfile`.
-- `3` — One or more targets failed to scan or were unscanned when `--fail-on-error` (or `--fail-on`) was specified.
+`regscout` asks registries about images, so an image that only exists in your local Docker daemon can't be scanned. Two options:
 
-### Examples
+1. **Push it, then scan it.** `docker push ghcr.io/you/app:1.2.3 && regscout ghcr.io/you/app:1.2.3`. Build with `--sbom=true` (BuildKit) so the registry carries an SBOM attestation, which gives accurate OS and language package coverage on registries without their own scanner (GHCR, GCR, ...).
+2. **Scan what goes into it.** Run `regscout --lockfile requirements.txt` (or `go.mod`, `package-lock.json`, ...) on the lockfiles your Dockerfile installs from, and `regscout <base-image>` on its `FROM` image.
+
+### Scanning what you already run
+
+Ask `regscout` to check the images referenced in your Dockerfiles or Kubernetes manifests:
 
 ```bash
-# 1. Scan container images only (Harbor, Quay, GHCR, Docker Hub)
-regscout \
-  registry.nersc.gov/example/test-image:0.4.0 \
-  quay.io/prometheus/prometheus:v2.55.1 \
-  ghcr.io/berriai/litellm:main-v1.60.0-stable \
-  --min-severity high
-
-# 2. Scan lockfiles only (no container image needed)
-regscout \
-  --lockfile ./requirements.txt \
-  --lockfile ./go.mod \
-  --min-severity high
-
-# 3. Scan individual packages only (no image or file needed)
-regscout --pkg pypi:pyjwt@2.10,go:golang.org/x/crypto@0.26.0 --min-severity high
-
-# 4. Combine images + lockfiles in a single structured JSON run for an AI agent
-regscout \
-  --image registry.nersc.gov/example/test-image:0.4.0 \
-  --lockfile ./requirements.txt \
-  --format json --min-severity high --fail-on-error
+grep -rhoE 'image: *\S+' k8s/ | awk '{print $2}' | sort -u | xargs regscout --min-severity high
 ```
+
+### In CI
+
+```bash
+regscout ghcr.io/you/app:1.2.3 --lockfile requirements.txt \
+  --min-severity high --fixable-only --fail-on high --fail-on-error
+```
+
+See [exit codes](docs.md#exit-codes) for what each result means.
+
+### With an AI agent
+
+Install the CLI, then give your agent the skill in [`skills/regscout/SKILL.md`](skills/regscout/SKILL.md) (for Claude Code, copy it to `~/.claude/skills/regscout/SKILL.md`; other agents read [`AGENTS.md`](AGENTS.md)). Then ask in plain language:
+
+> Scan the images in my `k8s/` manifests and my `requirements.txt` with regscout and tell me which upgrades to make.
+
+The agent runs `regscout --format json`, checks that every target was actually scanned, and proposes version bumps. See [`AGENTS.md`](AGENTS.md) for the JSON schema.
 
 ---
 
-## Running Tests
+## More
 
-```bash
-python3 -B -m unittest discover -s tests -t . -v
-```
+See [`docs.md`](docs.md) for [output formats and the JSON shape](docs.md#output-formats), [exit codes](docs.md#exit-codes), [all options and supported lockfiles](docs.md#options), [how scanning works](docs.md#how-it-works), and [privacy](docs.md#privacy).
