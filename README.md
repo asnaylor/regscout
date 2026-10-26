@@ -4,17 +4,17 @@
 
 Point `regscout` at the images you run (or build), the lockfiles in your repo, or individual packages. It reports each CVE with a severity, the installed version, and the version that fixes it. It reads scan results that registries already have, so for most images **nothing is pulled and no Docker daemon is needed**.
 
-**Built for agents as well as humans.** Run it yourself, or ask your coding agent (Claude Code, Codex, Cursor, ...) to run it. Agents get structured `--format json` output that never reports an unscanned target as clean, plus a ready-made [skill](skills/regscout/SKILL.md) and [`AGENTS.md`](AGENTS.md). For example:
-
-> Use regscout to scan the images in my `k8s/` manifests and my `requirements.txt`, and tell me which versions to upgrade to.
-
-See [With an AI agent](#with-an-ai-agent) for setup.
-
-```bash
-regscout postgres:16 quay.io/prometheus/prometheus:v2.55.1 --min-severity critical
-```
+**Built for agents as well as humans.** Run it in your terminal, or give your coding agent (Claude Code, Codex, Cursor, ...) the [skill](skills/regscout/SKILL.md) or [`AGENTS.md`](AGENTS.md) ([setup](#with-an-ai-agent)) and ask in plain language:
 
 ```text
+> Use regscout to scan the images in my k8s/ manifests and my requirements.txt, and tell me which versions to upgrade to.
+```
+
+Or from your terminal:
+
+```text
+$ regscout postgres:16 quay.io/prometheus/prometheus:v2.55.1 --min-severity critical
+
 ✗ postgres:16  [docker-scout]
   Summary  : 4 total (4 fixable) — 4 CRITICAL
   Recommended Upgrades:
@@ -75,16 +75,6 @@ regscout postgres:16 --fixable-only --min-severity high
 
 Images, lockfiles, and packages can be combined in one command.
 
-The NERSC example above reports (scanned server-side by Harbor's Trivy, nothing pulled):
-
-```text
-! registry.nersc.gov/library/nersc/tensorflow:ngc-24.05-v1  [harbor-trivy]
-  Summary  : 2 total (2 fixable) — 2 HIGH
-  Recommended Upgrades:
-    • Newtonsoft.Json            12.0.3 -> 13.0.1  (1 HIGH)
-    • jupyterlab                 2.3.2 -> 3.0.8  (1 HIGH)
-```
-
 ### Scanning images you built
 
 `regscout` asks registries about images, so an image that only exists in your local Docker daemon can't be scanned. Two options:
@@ -111,11 +101,7 @@ See [exit codes](docs.md#exit-codes) for what each result means.
 
 ### With an AI agent
 
-Install the CLI, then give your agent the skill in [`skills/regscout/SKILL.md`](skills/regscout/SKILL.md) (for Claude Code, copy it to `~/.claude/skills/regscout/SKILL.md`; other agents read [`AGENTS.md`](AGENTS.md)). Then ask in plain language:
-
-> Scan the images in my `k8s/` manifests and my `requirements.txt` with regscout and tell me which upgrades to make.
-
-The agent runs `regscout --format json`, checks that every target was actually scanned, and proposes version bumps. See [`AGENTS.md`](AGENTS.md) for the JSON schema.
+Install the CLI, then give your agent the skill in [`skills/regscout/SKILL.md`](skills/regscout/SKILL.md) (for Claude Code, copy it to `~/.claude/skills/regscout/SKILL.md`; other agents read [`AGENTS.md`](AGENTS.md)). The agent runs `regscout --format json`, checks that every target was actually scanned (never treating an unscanned target as clean), and proposes concrete version bumps. See [`AGENTS.md`](AGENTS.md) for the JSON schema.
 
 ---
 
